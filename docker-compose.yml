@@ -34,6 +34,7 @@ services:
       - task_network
 
   backend:
+    image: ${BACKEND_IMAGE:-task-manager-backend}
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -56,6 +57,7 @@ services:
       - task_network
 
   frontend:
+    image: ${FRONTEND_IMAGE:-task-manager-frontend}
     build:
       context: ./frontend
       dockerfile: Dockerfile

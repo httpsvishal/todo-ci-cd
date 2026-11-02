@@ -24,6 +24,8 @@ env:
   REDIS_TTL: 60
   NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:4000' }}
   ENV_FILE: ${{ secrets.ENV_FILE }}
+  CR_PAT: ${{ secrets.GITHUB_TOKEN }}
+  ACTOR: ${{ github.actor }}
 
 jobs:
   # =========================================================================
@@ -249,7 +251,7 @@ jobs:
           port: ${{ secrets.EC2_PORT || '22' }}
           timeout: 120s
           command_timeout: 30m
-          envs: ENV_FILE,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,PORT,REDIS_HOST,REDIS_PORT,REDIS_TTL,NEXT_PUBLIC_API_URL
+          envs: ENV_FILE,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,PORT,REDIS_HOST,REDIS_PORT,REDIS_TTL,NEXT_PUBLIC_API_URL,CR_PAT,ACTOR
           script: |
             set -e
             echo "=============================================="
@@ -307,8 +309,21 @@ jobs:
             EOF
             fi
 
-            echo "==> Rebuilding and restarting Docker Compose services..."
-            docker compose up -d --build --remove-orphans
+            IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+            export BACKEND_IMAGE="ghcr.io/${IMAGE_REPO}/backend:latest"
+            export FRONTEND_IMAGE="ghcr.io/${IMAGE_REPO}/frontend:latest"
+
+            echo "==> Authenticating with GitHub Container Registry on EC2..."
+            echo "$CR_PAT" | docker login ghcr.io -u "$ACTOR" --password-stdin || true
+
+            echo "==> Pulling pre-built production images from GHCR (zero compilation on server)..."
+            if docker compose pull; then
+              echo "==> Pre-built images pulled successfully! Starting containers..."
+              docker compose up -d --remove-orphans
+            else
+              echo "==> Pull failed, attempting local build fallback..."
+              docker compose up -d --build --remove-orphans
+            fi
 
             echo "==> Cleaning up unused dangling Docker images..."
             docker image prune -f
