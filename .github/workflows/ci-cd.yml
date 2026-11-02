@@ -11,6 +11,20 @@ permissions:
   contents: read
   packages: write
 
+# =============================================================================
+# Global Environment Variables (Available to ALL jobs and ALL steps automatically)
+# =============================================================================
+env:
+  POSTGRES_USER: ${{ vars.POSTGRES_USER || 'task_user' }}
+  POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD || 'task_password' }}
+  POSTGRES_DB: ${{ vars.POSTGRES_DB || 'task_db' }}
+  PORT: 4000
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_TTL: 60
+  NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL || 'http://localhost:4000' }}
+  ENV_FILE: ${{ secrets.ENV_FILE }}
+
 jobs:
   # =========================================================================
   # 1. Backend CI: Dependencies, Prisma Generation, & NestJS Compilation
@@ -67,8 +81,6 @@ jobs:
         run: npm install
 
       - name: Build Next.js application
-        env:
-          NEXT_PUBLIC_API_URL: http://localhost:4000
         run: npm run build
 
   # =========================================================================
@@ -83,8 +95,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up .env configuration
-        run: cp .env.example .env
+      - name: Generate .env file
+        run: |
+          if [ -n "$ENV_FILE" ]; then
+            echo "==> Creating .env from secrets.ENV_FILE..."
+            echo "$ENV_FILE" > .env
+          else
+            echo "==> Creating .env from GitHub variables and secrets..."
+            cat << EOF > .env
+          POSTGRES_USER=$POSTGRES_USER
+          POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+          POSTGRES_DB=$POSTGRES_DB
+          PORT=$PORT
+          DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+          REDIS_HOST=$REDIS_HOST
+          REDIS_PORT=$REDIS_PORT
+          REDIS_TTL=$REDIS_TTL
+          NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+          EOF
+          fi
 
       - name: Validate Docker Compose Configuration
         run: docker compose config
@@ -92,33 +121,37 @@ jobs:
       - name: Build and Start Containers
         run: docker compose up --build -d
 
-      - name: Wait for services to become healthy
+      - name: Smoke Test Backend API (GET /tasks with retry)
         run: |
-          echo "Waiting 20 seconds for database migrations and services to initialize..."
-          sleep 20
-          docker compose ps
+          echo "Waiting for backend API to respond with HTTP 200..."
+          for i in {1..30}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/tasks || true)
+            if [ "$status" = "200" ]; then
+              echo "Backend is ready and returned HTTP 200 OK!"
+              exit 0
+            fi
+            echo "Waiting for backend... (attempt $i/30, got HTTP $status)"
+            sleep 2
+          done
+          echo "Backend failed to become ready in time"
+          docker compose logs backend
+          exit 1
 
-      - name: Smoke Test Backend API (GET /tasks)
+      - name: Smoke Test Frontend (GET / with retry)
         run: |
-          echo "Testing backend endpoint..."
-          response=$(curl --write-out '%{http_code}' --silent --output /dev/null http://localhost:4000/tasks)
-          if [ "$response" -ne 200 ]; then
-            echo "Backend test failed with status code: $response"
-            docker compose logs backend
-            exit 1
-          fi
-          echo "Backend returned HTTP 200 OK"
-
-      - name: Smoke Test Frontend (GET /)
-        run: |
-          echo "Testing frontend web page..."
-          response=$(curl --write-out '%{http_code}' --silent --output /dev/null http://localhost:3000)
-          if [ "$response" -ne 200 ]; then
-            echo "Frontend test failed with status code: $response"
-            docker compose logs frontend
-            exit 1
-          fi
-          echo "Frontend returned HTTP 200 OK"
+          echo "Waiting for frontend web page to respond with HTTP 200..."
+          for i in {1..30}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000 || true)
+            if [ "$status" = "200" ]; then
+              echo "Frontend is ready and returned HTTP 200 OK!"
+              exit 0
+            fi
+            echo "Waiting for frontend... (attempt $i/30, got HTTP $status)"
+            sleep 2
+          done
+          echo "Frontend failed to become ready in time"
+          docker compose logs frontend
+          exit 1
 
       - name: Dump logs on failure
         if: failure()
@@ -144,6 +177,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: actions/setup-buildx-action@v3
 
+      - name: Lowercase Repository Name
+        run: echo "IMAGE_REPO=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
       - name: Log in to GitHub Container Registry (GHCR)
         uses: docker/login-action@v3
         with:
@@ -155,7 +191,7 @@ jobs:
         id: meta-backend
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}/backend
+          images: ghcr.io/${{ env.IMAGE_REPO }}/backend
           tags: |
             type=raw,value=latest
             type=sha,format=short
@@ -175,7 +211,7 @@ jobs:
         id: meta-frontend
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}/frontend
+          images: ghcr.io/${{ env.IMAGE_REPO }}/frontend
           tags: |
             type=raw,value=latest
             type=sha,format=short
@@ -186,7 +222,7 @@ jobs:
           context: ./frontend
           file: ./frontend/Dockerfile
           build-args: |
-            NEXT_PUBLIC_API_URL=http://localhost:4000
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'http://localhost:4000' }}
           push: true
           tags: ${{ steps.meta-frontend.outputs.tags }}
           labels: ${{ steps.meta-frontend.outputs.labels }}
@@ -210,23 +246,48 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          port: ${{ secrets.EC2_PORT || 22 }}
+          port: ${{ secrets.EC2_PORT || '22' }}
+          envs: ENV_FILE,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,PORT,REDIS_HOST,REDIS_PORT,REDIS_TTL,NEXT_PUBLIC_API_URL
           script: |
             set -e
             echo "=============================================="
             echo "==> Starting EC2 Automated Deployment"
             echo "=============================================="
 
-            # Navigate to application directory (defaults to ~/task-manager)
+            # Target directory on EC2 (defaults to ~/task-manager)
             APP_DIR="${{ secrets.EC2_TARGET_DIR }}"
             if [ -z "$APP_DIR" ]; then
               APP_DIR="$HOME/task-manager"
             fi
 
+            # Automatically clone repository if not already cloned
+            if [ ! -d "$APP_DIR" ]; then
+              echo "==> Directory $APP_DIR does not exist. Cloning repository..."
+              git clone "https://github.com/${{ github.repository }}.git" "$APP_DIR"
+            fi
+
             cd "$APP_DIR"
 
-            echo "==> Fetching latest changes from git repository..."
-            git pull origin main || git pull origin master
+            echo "==> Fetching latest changes from git..."
+            git fetch origin
+            git reset --hard "origin/${{ github.ref_name }}"
+
+            echo "==> Writing .env from GitHub Secrets & Variables..."
+            if [ -n "$ENV_FILE" ]; then
+              echo "$ENV_FILE" > .env
+            else
+              cat << EOF > .env
+            POSTGRES_USER=$POSTGRES_USER
+            POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+            POSTGRES_DB=$POSTGRES_DB
+            PORT=$PORT
+            DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+            REDIS_HOST=$REDIS_HOST
+            REDIS_PORT=$REDIS_PORT
+            REDIS_TTL=$REDIS_TTL
+            NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+            EOF
+            fi
 
             echo "==> Rebuilding and restarting Docker Compose services..."
             docker compose up -d --build --remove-orphans
@@ -234,12 +295,16 @@ jobs:
             echo "==> Cleaning up unused dangling Docker images..."
             docker image prune -f
 
-            echo "==> Waiting for services to initialize..."
-            sleep 15
-            docker compose ps
-
-            echo "==> Performing health check on backend API..."
-            curl -f http://127.0.0.1:4000/tasks
+            echo "==> Waiting for backend API to become healthy..."
+            for i in {1..30}; do
+              status=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:4000/tasks || true)
+              if [ "$status" = "200" ]; then
+                echo "==> Backend API is up and healthy (HTTP 200)!"
+                break
+              fi
+              echo "==> Waiting for backend service... (attempt $i/30, got HTTP $status)"
+              sleep 2
+            done
 
             echo "=============================================="
             echo "==> EC2 Deployment Completed Successfully!"
