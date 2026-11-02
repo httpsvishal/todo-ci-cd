@@ -270,13 +270,20 @@ jobs:
 
             cd "$APP_DIR"
 
-            # Ensure 2GB swap space exists (prevents OOM crashes on EC2 free-tier)
+            # Ensure 1GB swap space exists (optimal balance of memory and disk on 8GB root volume)
             if [ ! -f /swapfile ] && command -v sudo >/dev/null 2>&1; then
-              echo "==> Configuring 2GB swap space on EC2..."
-              sudo fallocate -l 2G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+              echo "==> Configuring 1GB swap space on EC2..."
+              sudo fallocate -l 1G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=1024
               sudo chmod 600 /swapfile
               sudo mkswap /swapfile
               sudo swapon /swapfile || true
+            fi
+
+            echo "==> Freeing disk space on EC2..."
+            docker builder prune -af || true
+            docker system prune -f || true
+            if command -v sudo >/dev/null 2>&1; then
+              sudo apt-get clean || true
             fi
 
             echo "==> Fetching latest changes from git..."
