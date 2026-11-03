@@ -2,6 +2,8 @@
 
 import { useState, useEffect, FormEvent } from 'react';
 
+// Types
+
 interface Task {
   id: number;
   title: string;
